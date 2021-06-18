@@ -45,6 +45,7 @@ class Importer:
 			file_path or data_import.google_sheets_url or data_import.import_file,
 			self.template_options,
 			self.import_type,
+			data_import=self.data_import
 		)
 
 	def get_data_for_import_preview(self):
@@ -309,7 +310,7 @@ class Importer:
 
 
 class ImportFile:
-	def __init__(self, doctype, file, template_options=None, import_type=None):
+	def __init__(self, doctype, file, template_options=None, import_type=None, data_import=None):
 		self.doctype = doctype
 		self.template_options = template_options or frappe._dict(
 			column_to_field_map=frappe._dict()
@@ -317,6 +318,7 @@ class ImportFile:
 		self.column_to_field_map = self.template_options.column_to_field_map
 		self.import_type = import_type
 		self.warnings = []
+		self.data_import = data_import
 
 		self.file_doc = self.file_path = self.google_sheets_url = None
 		if isinstance(file, frappe.string_types):
@@ -369,9 +371,10 @@ class ImportFile:
 				continue
 
 			if not header:
-				header = Header(i, row, self.doctype, self.raw_data, self.column_to_field_map)
+				header = Header(i, row, self.doctype, self.raw_data, self.column_to_field_map,
+					data_import=self.data_import)
 			else:
-				row_obj = Row(i, row, self.doctype, header, self.import_type)
+				row_obj = Row(i, row, self.doctype, header, self.import_type, data_import=self.data_import)
 				data.append(row_obj)
 
 		self.header = header
@@ -449,6 +452,10 @@ class ImportFile:
 			data_without_first_row = data[1:]
 			for row in data_without_first_row:
 				row_values = row.get_values(parent_column_indexes)
+				# all parent values same
+				if self.data_import.dealership and parent_row_values == row_values:
+					rows.append(row)
+					continue
 				# if the row is blank, it's a child row doc
 				if all([v in INVALID_VALUES for v in row_values]):
 					rows.append(row)
@@ -471,6 +478,32 @@ class ImportFile:
 					parent_doc[table_df.fieldname].append(child_doc)
 
 		doc = parent_doc
+
+		if self.import_type == INSERT:
+			# check if there is atleast one row for mandatory table fields
+			meta = frappe.get_meta(self.doctype)
+			mandatory_table_fields = [
+				df
+				for df in meta.fields
+				if df.fieldtype in table_fieldtypes
+				and df.reqd
+				and len(doc.get(df.fieldname, [])) == 0
+			]
+			if len(mandatory_table_fields) == 1:
+				self.warnings.append(
+					{
+						"row": first_row.row_number,
+						"message": _("There should be atleast one row for {0} table").format(
+							frappe.bold(mandatory_table_fields[0].label)
+						),
+					}
+				)
+			elif mandatory_table_fields:
+				fields_string = ", ".join([df.label for df in mandatory_table_fields])
+				message = _("There should be atleast one row for the following tables: {0}").format(
+					fields_string
+				)
+				self.warnings.append({"row": first_row.row_number, "message": message})
 
 		return doc, rows, data[len(rows) :]
 
@@ -521,7 +554,7 @@ class ImportFile:
 class Row:
 	link_values_exist_map = {}
 
-	def __init__(self, index, row, doctype, header, import_type):
+	def __init__(self, index, row, doctype, header, import_type, data_import=None):
 		self.index = index
 		self.row_number = index + 1
 		self.doctype = doctype
@@ -529,6 +562,7 @@ class Row:
 		self.header = header
 		self.import_type = import_type
 		self.warnings = []
+		self.data_import = data_import
 
 		len_row = len(self.data)
 		len_columns = len(self.header.columns)
@@ -600,6 +634,15 @@ class Row:
 				new_doc.update(doc)
 				doc = new_doc
 
+		if not self.data_import.dealership:
+			self.check_mandatory_fields(doctype, doc, table_df)
+
+		if hasattr(doc, 'dealership') and self.data_import.dealership:
+			doc['dealership'] = self.data_import.dealership
+
+		if hasattr(doc, 'record_type') and self.data_import.record_type:
+			doc['record_type'] = self.data_import.record_type
+
 		return doc
 
 	def validate_value(self, value, col):
@@ -614,7 +657,7 @@ class Row:
 				)
 				return
 
-		elif df.fieldtype == "Link":
+		elif df.fieldtype == "Link" and not self.data_import.dealership:
 			exists = self.link_exists(value, df)
 			if not exists:
 				msg = _("Value {0} missing for {1}").format(
@@ -641,7 +684,7 @@ class Row:
 				return
 		elif df.fieldtype == "Duration":
 			import re
-			is_valid_duration = re.match(r"^(?:(\d+d)?((^|\s)\d+h)?((^|\s)\d+m)?((^|\s)\d+s)?)$", value)
+			is_valid_duration = re.match("^(?:(\d+d)?((^|\s)\d+h)?((^|\s)\d+m)?((^|\s)\d+s)?)$", value)
 			if not is_valid_duration:
 				self.warnings.append(
 					{
@@ -700,6 +743,66 @@ class Row:
 				pass
 		return value
 
+	def check_mandatory_fields(self, doctype, doc, table_df=None):
+		"""If import type is Insert:
+			Check for mandatory fields (except table fields) in doc
+		if import type is Update:
+			Check for name field or autoname field in doc
+		"""
+		meta = frappe.get_meta(doctype)
+		if self.import_type == UPDATE:
+			if meta.istable:
+				# when updating records with table rows,
+				# there are two scenarios:
+				# 1. if row 'name' is provided in the template
+				# the table row will be updated
+				# 2. if row 'name' is not provided
+				# then a new row will be added
+				# so we dont need to check for mandatory
+				return
+
+			# for update, only ID (name) field is mandatory
+			id_field = get_id_field(doctype)
+			if doc.get(id_field.fieldname) in INVALID_VALUES:
+				self.warnings.append(
+					{
+						"row": self.row_number,
+						"message": _("{0} is a mandatory field").format(id_field.label),
+					}
+				)
+			return
+
+		fields = [
+			df
+			for df in meta.fields
+			if df.fieldtype not in table_fieldtypes
+			and df.reqd
+			and doc.get(df.fieldname) in INVALID_VALUES
+		]
+
+		if not fields:
+			return
+
+		def get_field_label(df):
+			return "{0}{1}".format(df.label, " ({})".format(table_df.label) if table_df else "")
+
+		if len(fields) == 1:
+			field_label = get_field_label(fields[0])
+			self.warnings.append(
+				{
+					"row": self.row_number,
+					"message": _("{0} is a mandatory field").format(frappe.bold(field_label)),
+				}
+			)
+		else:
+			fields_string = ", ".join([frappe.bold(get_field_label(df)) for df in fields])
+			self.warnings.append(
+				{
+					"row": self.row_number,
+					"message": _("{0} are mandatory fields").format(fields_string),
+				}
+			)
+
 	def get_values(self, indexes):
 		return [self.data[i] for i in indexes]
 
@@ -711,11 +814,13 @@ class Row:
 
 
 class Header(Row):
-	def __init__(self, index, row, doctype, raw_data, column_to_field_map=None):
+	def __init__(self, index, row, doctype, raw_data, column_to_field_map=None, data_import=None):
 		self.index = index
 		self.row_number = index + 1
 		self.data = row
 		self.doctype = doctype
+		self.data_import = data_import
+
 		column_to_field_map = column_to_field_map or frappe._dict()
 
 		self.seen = []
@@ -724,7 +829,9 @@ class Header(Row):
 		for j, header in enumerate(row):
 			column_values = [get_item_at_index(r, j) for r in raw_data]
 			map_to_field = column_to_field_map.get(str(j))
-			column = Column(j, header, self.doctype, column_values, map_to_field, self.seen)
+			column = Column(
+				j, header, self.doctype, column_values, map_to_field, self.seen, data_import=self.data_import
+			)
 			self.seen.append(header)
 			self.columns.append(column)
 
@@ -764,7 +871,7 @@ class Column:
 	seen = []
 	fields_column_map = {}
 
-	def __init__(self, index, header, doctype, column_values, map_to_field=None, seen=[]):
+	def __init__(self, index, header, doctype, column_values, map_to_field=None, seen=[], data_import=None):
 		self.index = index
 		self.column_number = index + 1
 		self.doctype = doctype
@@ -772,6 +879,7 @@ class Column:
 		self.column_values = column_values
 		self.map_to_field = map_to_field
 		self.seen = seen
+		self.data_import = data_import
 
 		self.date_format = None
 		self.df = None
@@ -901,7 +1009,7 @@ class Column:
 		if self.skip_import:
 			return
 
-		if self.df.fieldtype == "Link":
+		if self.df.fieldtype == 'Link' and not self.data_import.dealership:
 			# find all values that dont exist
 			values = list(set([cstr(v) for v in self.column_values[1:] if v]))
 			exists = [
@@ -929,7 +1037,10 @@ class Column:
 				self.warnings.append(
 					{
 						"col": self.column_number,
-						"message": _("Date format could not be determined from the values in this column. Defaulting to yyyy-mm-dd."),
+						"message": _(
+							"Date format could not be determined from the values in"
+							" this column. Defaulting to yyyy-mm-dd."
+						),
 						"type": "info",
 					}
 				)
