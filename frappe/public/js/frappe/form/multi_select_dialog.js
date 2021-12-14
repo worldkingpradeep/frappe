@@ -70,6 +70,7 @@ frappe.ui.form.MultiSelectDialog = class MultiSelectDialog {
 		this.dialog = new frappe.ui.Dialog({
 			title: title,
 			fields: this.fields,
+			size: this.size,
 			primary_action_label: this.primary_action_label || __("Get Items"),
 			secondary_action_label: __("Make {0}", [__(this.doctype)]),
 			primary_action: () => {
@@ -135,7 +136,7 @@ frappe.ui.form.MultiSelectDialog = class MultiSelectDialog {
 			this.get_child_result().then(r => {
 				this.child_results = r.message || [];
 				this.render_child_datatable();
-	
+
 				this.$wrapper.addClass('hidden');
 				this.$child_wrapper.removeClass('hidden');
 				this.dialog.fields_dict.more_btn.$wrapper.hide();
@@ -324,7 +325,9 @@ frappe.ui.form.MultiSelectDialog = class MultiSelectDialog {
 		let parent_names = this.child_datatable.rowmanager.checkMap.reduce((parent_names, checked, index) => {
 			if (checked == 1) {
 				const parent_name = this.child_results[index].parent;
-				parent_names.push(parent_name);
+				if (!parent_names.includes(parent_name)) {
+					parent_names.push(parent_name);
+				}
 			}
 			return parent_names;
 		}, []);
