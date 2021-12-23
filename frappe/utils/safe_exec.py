@@ -163,8 +163,6 @@ def get_safe_globals():
 			rollback = frappe.db.rollback
 		)
 
-		out.frappe.cache = cache
-
 	if frappe.response:
 		out.frappe.response = frappe.response
 
